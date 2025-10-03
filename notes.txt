@@ -1,0 +1,3 @@
+Our atlas cluster has connections from both the datacenter, and our hetzner server.
+    - Specifically: 135.181.183.214, h2
+Also, our server has weird connections too...
