@@ -1,3 +1,4 @@
+import { magenta } from "socket-function/src/formatting/logColors";
 import { runPromise } from "socket-function/src/runPromise";
 
 export interface ProcessConnection {
@@ -8,6 +9,16 @@ export interface ProcessConnection {
     localAddress: string;
     localPort: number;
     state: string;
+}
+
+export interface ProcessInfo {
+    pid: number;
+    processName: string;
+    args: string[];
+}
+
+export interface AddressProcessMap {
+    [address: string]: ProcessInfo[];
 }
 
 /**
@@ -78,41 +89,106 @@ export function parseConnectionsToTarget(ssOutput: string, targetIp: string): Pr
 }
 
 /**
- * Get command line arguments for a process by PID
+ * Get all command line arguments for all processes on a remote
+ * Returns a map of PID -> args[]
  */
-export async function getProcessCmdline(remote: string, pid: number): Promise<string[]> {
-    const cmdlineCommand = `ssh ${remote} "sudo cat /proc/${pid}/cmdline"`;
-    const cmdline = await runPromise(cmdlineCommand, { quiet: true });
-    // Split by null terminators and filter out empty strings
-    return cmdline.split('\0').filter(arg => arg.length > 0);
+export async function getAllCmdlines(remote: string): Promise<Map<number, string[]>> {
+    const cmd = `find /proc -maxdepth 2 -name cmdline -type f 2>/dev/null | while read f; do pid=$(echo $f | cut -d/ -f3); echo -n "$pid:"; cat "$f" 2>/dev/null; echo; done`;
+
+    try {
+        const result = await runPromise(`ssh ${remote} "${cmd}"`, { quiet: true });
+
+        const pidMap = new Map<number, string[]>();
+        const lines = result.split('\n');
+
+        for (const line of lines) {
+            if (!line.trim()) continue;
+
+            const colonIdx = line.indexOf(':');
+            if (colonIdx === -1) continue;
+
+            const pidStr = line.substring(0, colonIdx);
+            const pid = parseInt(pidStr, 10);
+            if (isNaN(pid)) continue;
+
+            const cmdlineData = line.substring(colonIdx + 1);
+            const args = cmdlineData.split('\0').filter(arg => arg.length > 0);
+            pidMap.set(pid, args);
+        }
+
+        return pidMap;
+    } catch (e) {
+        console.error(e);
+        return new Map();
+    }
 }
 
 /**
- * Get all process information for connections to a target IP
+ * Get all process information for all connections
  */
-export async function getProcessInfoForTarget(remote: string, targetIp: string): Promise<void> {
-    // Run SSH command to get ss output with process info (only established connections)
-    const sshCommand = `ssh ${remote} "sudo ss -tanp"`;
-    const result = await runPromise(sshCommand, { quiet: true });
+export async function getAllProcessInfo(remote: string, addresses: string[]): Promise<AddressProcessMap> {
+    const result: AddressProcessMap = {};
+    console.log(`Getting process info for ${addresses.length} addresses`);
 
-    // Parse and extract connections to target IP
-    const connections = parseConnectionsToTarget(result, targetIp);
+    // Get all cmdlines once
+    const cmdlineMap = await getAllCmdlines(remote);
 
-    if (connections.length === 0) {
-        return;
-    }
+    // Get listening sockets with process info
+    const listenResult = await runPromise(`ssh ${remote} "sudo ss -tlnp"`, { quiet: true });
+    // Get established connections with process info
+    const establishedResult = await runPromise(`ssh ${remote} "sudo ss -tanp"`, { quiet: true });
 
-    // Get unique PIDs
-    const uniquePids = [...new Set(connections.map(c => c.pid).filter(pid => pid > 0))];
+    // NOTE: If we run in parallel, the remote server often gives us issues and never responds. 
+    await Promise.all(addresses.map(async (address) => {
+        result[address] = [];
 
-    // For each PID, get the command line arguments
-    for (const pid of uniquePids) {
-        try {
-            const args = await getProcessCmdline(remote, pid);
-            console.log(pid, JSON.stringify(args));
-        } catch (e) {
-            // Skip processes that have ended
+        if (address.startsWith(":")) {
+            // Handle listening ports
+            const port = address.substring(1);
+            const lines = listenResult.split('\n');
+            const pidsProcessed = new Set<number>();
+
+            await Promise.all(lines.map(async (line) => {
+                if (!line.trim() || line.includes('Peer Address') || line.includes('State')) {
+                    return;
+                }
+
+                if (line.includes(`:${port} `) || line.includes(`:${port}\t`)) {
+                    const parts = line.trim().split(/\s+/);
+
+                    if (parts.length >= 4) {
+                        const processInfo = parts.slice(4).join(' ');
+                        const pidMatch = processInfo.match(/pid=(\d+)/);
+
+                        if (pidMatch) {
+                            const pid = parseInt(pidMatch[1], 10);
+
+                            if (!pidsProcessed.has(pid)) {
+                                pidsProcessed.add(pid);
+                                const nameMatch = processInfo.match(/\("([^"]+)"/);
+                                const processName = nameMatch ? nameMatch[1] : 'unknown';
+
+                                const args = cmdlineMap.get(pid) || [];
+                                result[address].push({ pid, processName, args });
+                            }
+                        }
+                    }
+                }
+            }));
+        } else {
+            // Handle regular IP addresses (established connections)
+            const connections = parseConnectionsToTarget(establishedResult, address);
+            const uniquePids = [...new Set(connections.map(c => c.pid).filter(pid => pid > 0))];
+
+            await Promise.all(uniquePids.map(async (pid) => {
+                const conn = connections.find(c => c.pid === pid);
+                const processName = conn ? conn.processName : 'unknown';
+
+                const args = cmdlineMap.get(pid) || [];
+                result[address].push({ pid, processName, args });
+            }));
         }
-    }
-}
+    }));
 
+    return result;
+}

@@ -5,8 +5,7 @@
   "license": "MIT",
   "scripts": {
     "start": "yarn install && yarn typenode index.ts",
-    "r": "yarn typenode index.ts",
-    "r2": "yarn typenode index2.ts"
+    "r": "yarn typenode index.ts"
   },
   "dependencies": {
     "@types/prompts": "^2.4.9",

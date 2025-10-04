@@ -2,9 +2,9 @@ import { runPromise } from "socket-function/src/runPromise";
 import dns from "dns";
 import yargs from "yargs";
 import prompts from "prompts";
-import { getProcessInfoForTarget } from "./parser";
+import { getAllProcessInfo } from "./parser";
 import { sort } from "socket-function/src/misc";
-import { blue, green } from "socket-function/src/formatting/logColors";
+import { blue, green, magenta } from "socket-function/src/formatting/logColors";
 import fs from "fs";
 import os from "os";
 
@@ -41,6 +41,7 @@ interface IPInfoResponse {
 const ipInfoCache = new Map<string, string>();
 
 async function getIPInfo(ip: string): Promise<string> {
+    if (ip.startsWith(":")) return "";
     if (!ipinfoKey) {
         return "";
     }
@@ -85,7 +86,7 @@ function parseForeignAddresses(ssOutput: string): ConnectionInfo[] {
             continue;
         }
         if (line.includes("TIME-WAIT")) continue;
-        console.log(line);
+
 
         // Split by whitespace
         const parts = line.trim().split(/\s+/);
@@ -112,6 +113,8 @@ function parseForeignAddresses(ssOutput: string): ConnectionInfo[] {
             }
         }
 
+        if (foreignAddress === '[::]') continue;
+
         // Add to map if it's a valid foreign address (not local/wildcard)
         if (foreignAddress && foreignAddress !== '0.0.0.0' && foreignAddress !== '*' && foreignAddress !== '127.0.0.1') {
             // Determine direction: if local port is ephemeral (> 32768), we likely initiated
@@ -124,6 +127,13 @@ function parseForeignAddresses(ssOutput: string): ConnectionInfo[] {
             } else {
                 connectionsMap.set(foreignAddress, isOutgoing);
             }
+        } else if ((foreignAddress === '0.0.0.0' || foreignAddress === "*") && line.includes('LISTEN')) {
+            // Parse the port, and have that be the full address
+            const match = line.match(/0\.0\.0\.0:(\d+)/) || line.match(/\*:(\d+)/);
+            if (match) {
+                const port = match[1];
+                connectionsMap.set(`:${port}`, true);
+            }
         }
     }
 
@@ -132,30 +142,6 @@ function parseForeignAddresses(ssOutput: string): ConnectionInfo[] {
         isOutgoing
     }));
 }
-
-// Ah, we didn't update the servicer script, so it might be connecting to the old Atlas. 
-/*
-
-cd ~/servicer
-git add --all
-git stash
-git pull
-git checkout db2-webapp
-yarn install
-bash ~/startup.sh
-
-
-*/
-// 45.62.209.66
-//     old server
-// 45.62.209.67
-//     old server 2
-// 178.128.234.75
-//     s.planquickly.com
-// 65.108.70.179
-//     h1.planquickly.com
-// 135.181.183.214
-//     h2.planquickly.com
 
 async function main() {
     let addrLookup: {
@@ -193,11 +179,11 @@ async function main() {
     }
 
     // Run SSH command to get ss output
-    const sshCommand = `ssh ${remote} "ss -tan"`;
-    const result = await runPromise(sshCommand, { quiet: true });
-
+    let result = await runPromise(`ssh ${remote} "ss -tan"`, { quiet: true });
+    //result += "\n" + await runPromise(`ssh ${remote} "ss -tln"`, { quiet: true });
     // Parse and extract foreign addresses
     const connections = parseForeignAddresses(result);
+    sort(connections, x => x.foreignAddress.startsWith(":") ? 0 : 1);
     sort(connections, x => x.isOutgoing ? 0 : 1);
 
     // Fetch IP info for all connections if token is available
@@ -205,13 +191,46 @@ async function main() {
         await Promise.all(connections.map(conn => getIPInfo(conn.foreignAddress)));
     }
 
+    // Get all process information for all connections
+    console.log("Fetching process information...");
+    const addresses = connections.map(c => c.foreignAddress);
+    const processMap = await getAllProcessInfo(remote, addresses);
+    console.log("");
+
     // Create choices for interactive selection
     const choices = connections.map((conn, index) => {
-        let direction = conn.isOutgoing ? green("OUT") : blue("IN ");
+        let direction = conn.isOutgoing ? green("OUT   ") : blue("IN    ");
+        if (conn.foreignAddress.startsWith(":")) {
+            direction = magenta("LISTEN");
+        }
         const name = getName(conn.foreignAddress);
         const location = ipInfoCache.get(conn.foreignAddress) || "";
         const locationStr = location ? ` [${location}]` : "";
-        const title = `${index + 1}. ${direction} ${name.padEnd(30)} ${conn.foreignAddress}${locationStr}`;
+
+        // Get unique executable names for this address
+        const processes = processMap[conn.foreignAddress] || [];
+        const executables = [...new Set(
+            processes.map(p => {
+                if (p.args[0] === "/usr/bin/node") {
+                    let entry = p.args.find(x => x.endsWith(".ts") || x.endsWith(".tsx"));
+                    if (entry) {
+                        return entry;
+                    }
+                }
+                return p.args[0] || p.processName;
+            })
+                .filter(Boolean)
+                .map(x => blue(x))
+        )];
+        const execStr = executables.length > 0 ? ` (${executables.length} = ${executables.join(" | ")})` : "";
+
+        function ellipsis(str: string, length: number) {
+            if (str.length > length) {
+                return str.substring(0, length) + "...";
+            }
+            return str;
+        }
+        const title = `${index + 1}. ${direction} ${name.padEnd(30)} ${conn.foreignAddress}${locationStr}${ellipsis(execStr, 100)}`;
         return {
             title,
             value: conn.foreignAddress,
@@ -219,33 +238,78 @@ async function main() {
         };
     });
 
-    // Display all connections
-    for (let choice of choices) {
-        console.log(choice.title);
-    }
-    console.log('');
+    while (true) {
+        console.log();
+        // Interactive selection
+        const response = await prompts({
+            type: 'autocomplete',
+            name: 'selectedIp',
+            message: 'Type to filter, enter to select (arrow keys to navigate):',
+            choices: choices,
+            limit: 50,
+            suggest: (input, choices) => {
+                const inputLower = input.toLowerCase();
+                return Promise.resolve(
+                    choices.filter(choice =>
+                        choice.title.toLowerCase().includes(inputLower) ||
+                        choice.value.toString() === input
+                    )
+                );
+            }
+        }, {
+            onCancel: () => {
+                console.log('\nExiting...');
+                process.exit(0);
+            }
+        });
 
-    // Interactive selection
-    const response = await prompts({
-        type: 'autocomplete',
-        name: 'selectedIp',
-        message: 'Type to filter, enter to select (arrow keys to navigate):',
-        choices: choices,
-        suggest: (input, choices) => {
-            const inputLower = input.toLowerCase();
-            return Promise.resolve(
-                choices.filter(choice =>
-                    choice.title.toLowerCase().includes(inputLower) ||
-                    choice.value.toString() === input
-                )
-            );
+
+        console.log();
+        if (response.selectedIp) {
+            let info = processMap[response.selectedIp];
+            for (let process of info) {
+                console.log(`\n${magenta(process.pid.toString())} ${process.args.join(" ")}`);
+            }
         }
-    });
-
-    if (response.selectedIp) {
-        console.log(`\nInvestigating connections to ${response.selectedIp}...\n`);
-        await getProcessInfoForTarget(remote, response.selectedIp);
+        console.log();
+        // Wait until the user presses enter, on ctrl+c exit
+        await prompts({
+            type: 'text',
+            name: 'enter',
+            message: 'Press enter to continue'
+        }, {
+            onCancel: () => {
+                console.log('\nExiting...');
+                process.exit(0);
+            }
+        });
     }
 }
 
 main().catch(console.error).finally(() => process.exit());
+
+
+
+// Ah, we didn't update the servicer script, so it might be connecting to the old Atlas. 
+/*
+
+cd ~/servicer
+git add --all
+git stash
+git pull
+git checkout db2-webapp
+yarn install
+bash ~/startup.sh
+
+
+*/
+// 45.62.209.66
+//     old server
+// 45.62.209.67
+//     old server 2
+// 178.128.234.75
+//     s.planquickly.com
+// 65.108.70.179
+//     h1.planquickly.com
+// 135.181.183.214
+//     h2.planquickly.com
